@@ -1,116 +1,140 @@
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
 from pymongo import MongoClient
-import base64
-import json
+import os
 from bson import ObjectId
+from rembg import remove
 
 app = Flask(__name__)
 CORS(app)
 
 # MongoDB Connection
-client = MongoClient('mongodb://localhost:27017/')
+client = MongoClient('mongodb://127.0.0.1:27017/shoes')
 db = client['shoe_store']
 shoes_collection = db['shoes']
 
-def get_available_camera():
-    """Detects available camera index."""
-    for index in range(5):  # Check camera indexes 0 to 4
+# Detect and use an external camera
+def get_external_camera():
+    """Detects and returns the index of an external camera."""
+    for index in range(5):  # Check up to 5 camera indexes
         cap = cv2.VideoCapture(index)
         if cap.isOpened():
             cap.release()
             return index
     return None
 
-# Automatically detect the available camera index
-camera_index = get_available_camera()
+camera_index = get_external_camera()
 if camera_index is None:
-    print("No available camera found.")
-    camera = None
-else:
-    camera = cv2.VideoCapture(camera_index)
-    print(f"Using camera index: {camera_index}")
+    raise RuntimeError("No external camera detected!")
+
+camera = cv2.VideoCapture(camera_index)
 
 def remove_background(image_path):
-    """Remove background from the shoe image using OpenCV."""
-    image = cv2.imread(image_path)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    """Removes the background from a shoe image using rembg."""
+    with open(image_path, "rb") as f:
+        image_data = f.read()
     
-    # Apply threshold to remove white background
-    _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    output_data = remove(image_data)
     
-    # Apply mask to keep only shoe
-    result = cv2.bitwise_and(image, image, mask=mask)
-    return result
+    np_array = np.frombuffer(output_data, np.uint8)
+    processed_image = cv2.imdecode(np_array, cv2.IMREAD_UNCHANGED)
+
+    return processed_image
 
 def detect_foot(frame):
-    """Detect foot in the camera frame using contours."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY)
+    """Detects the foot region in the frame using color thresholding."""
+    # Convert frame to HSV color space
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Define a range for skin color (adjust these values as needed)
+    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+    upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+
+    # Create a mask for the foot region
+    mask = cv2.inRange(hsv, lower_skin, upper_skin)
+
+    # Find contours in the mask
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     if contours:
-        foot_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(foot_contour)
+        # Find the largest contour (assumed to be the foot)
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
         return x, y, w, h
-    return None
+    else:
+        return None
 
-@app.route('/api/shoes', methods=['GET'])
-def get_shoes():
-    """Fetch shoe data from MongoDB."""
-    shoes = list(shoes_collection.find())
-    for shoe in shoes:
-        shoe['_id'] = str(shoe['_id'])  # Convert ObjectId to string for JSON
-    return jsonify(shoes)
+def overlay_shoe(frame, shoe_image, x, y, w, h):
+    """Overlays the shoe image onto the detected foot region."""
+    if shoe_image is None or shoe_image.shape[0] == 0 or shoe_image.shape[1] == 0:
+        return frame
 
-@app.route('/api/try-on', methods=['POST'])
-def virtual_try_on():
-    """Capture camera feed, detect foot, overlay shoe, and return image."""
-    if camera is None:
-        return jsonify({'error': 'No available camera detected'})
+    shoe_resized = cv2.resize(shoe_image, (w, h), interpolation=cv2.INTER_AREA)
 
-    data = request.json
-    shoe_id = data['shoeId']
-    
-    # Retrieve shoe image from MongoDB
-    shoe = shoes_collection.find_one({'_id': ObjectId(shoe_id)})
-    shoe_image_path = shoe.get('image', None)
-    if not shoe_image_path:
-        return jsonify({'error': 'Shoe image not found'})
+    if shoe_resized.shape[2] == 3:
+        shoe_resized = cv2.cvtColor(shoe_resized, cv2.COLOR_BGR2BGRA)
+        shoe_resized[:, :, 3] = 255  # Ensure transparency
 
-    # Capture camera frame
-    ret, frame = camera.read()
-    if not ret:
-        return jsonify({'error': 'Failed to capture camera frame'})
-
-    # Detect foot in the frame
-    foot_bbox = detect_foot(frame)
-    if foot_bbox is None:
-        return jsonify({'error': 'Foot not detected'})
-
-    x, y, w, h = foot_bbox
-
-    # Process shoe image
-    shoe_image = remove_background(shoe_image_path)
-    shoe_resized = cv2.resize(shoe_image, (w, h))
-
-    # Overlay shoe onto detected foot
     overlay_result = frame.copy()
-    for c in range(0, 3):
+    for c in range(3):
         overlay_result[y:y+h, x:x+w, c] = np.where(
-            shoe_resized[:, :, c] == 0,
+            shoe_resized[:, :, 3] == 0,
             frame[y:y+h, x:x+w, c],
             shoe_resized[:, :, c]
         )
 
-    # Convert processed image to Base64
-    _, buffer = cv2.imencode('.jpg', overlay_result)
-    processed_image = base64.b64encode(buffer).decode('utf-8')
+    return overlay_result
 
-    return jsonify({'result': processed_image})
+@app.route('/video_feed/<shoe_id>')
+def video_feed(shoe_id):
+    """Streams processed video frames with shoe overlay."""
+    shoe = shoes_collection.find_one({'_id': ObjectId(shoe_id)})
+    if not shoe:
+        return jsonify({'error': 'Shoe not found'}), 404
+
+    shoe_image_path = shoe.get('image')
+    if not shoe_image_path or not os.path.exists(shoe_image_path):
+        return jsonify({'error': 'Shoe image not found'}), 500
+
+    shoe_image = remove_background(shoe_image_path)
+
+    def generate_frames():
+        while True:
+            success, frame = camera.read()
+            if not success:
+                break
+
+            # Detect foot in the frame
+            foot_region = detect_foot(frame)
+            if foot_region:
+                x, y, w, h = foot_region
+                # Overlay the shoe image on the detected foot region
+                processed_frame = overlay_shoe(frame, shoe_image, x, y, w, h)
+            else:
+                processed_frame = frame  # No foot detected, return the original frame
+
+            # Encode the frame as JPEG
+            _, buffer = cv2.imencode('.jpg', processed_frame)
+            frame_data = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Releases the camera when closing the server."""
+    global camera
+    if camera:
+        camera.release()
+        camera = None
+    return jsonify({'message': 'Camera released and server shutting down'}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    try:
+        app.run(debug=True, port=5000)
+    finally:
+        if camera:
+            camera.release()
