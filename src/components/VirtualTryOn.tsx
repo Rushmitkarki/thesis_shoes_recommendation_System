@@ -11,21 +11,49 @@ export const VirtualTryOn: React.FC<VirtualTryOnProps> = ({
   selectedShoe,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
-    if (selectedShoe?.id) {
-      const video = videoRef.current;
-      if (video) {
-        video.src = `http://localhost:5000/video_feed/${selectedShoe.id}`;
-        video.load();
-        video.play();
+    const startCamera = async () => {
+      try {
+        // Request access to camera
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+        });
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+
+        streamRef.current = stream;
+
+        // Delay before switching to shoe try-on video
+        setTimeout(() => {
+          if (videoRef.current) {
+            videoRef.current.srcObject = null;
+            videoRef.current.src = `http://localhost:5000/video_feed/${selectedShoe.id}`;
+            videoRef.current.load();
+            videoRef.current.play();
+          }
+        }, 3000); // Wait 3 seconds before switching to try-on video
+      } catch (error) {
+        console.error("Error accessing camera:", error);
       }
-    }
+    };
+
+    startCamera();
 
     return () => {
+      // Stop camera stream
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      }
+
+      // Notify backend to stop processing
       axios
         .post("http://localhost:5000/stop_camera")
         .catch((error) => console.error("Error stopping camera:", error));
+
       if (videoRef.current) {
         videoRef.current.pause();
         videoRef.current.src = "";

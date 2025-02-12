@@ -104,52 +104,33 @@ def overlay_shoe(frame, shoe_image, x, y, w, h):
 
     return overlay_result
 
-@app.route('/video_feed/<shoe_id>')
+def generate_video():
+    """Simulated function to return a video stream (Replace with actual implementation)"""
+    global camera
+    camera = cv2.VideoCapture(0)  # Open camera
+
+    while True:
+        success, frame = camera.read()
+        if not success:
+            break
+        _, buffer = cv2.imencode(".jpg", frame)
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+        )
+
+@app.route("/video_feed/<string:shoe_id>")
 def video_feed(shoe_id):
-    """Streams processed video frames with shoe overlay."""
-    global camera
-    if not camera or not camera.isOpened():  # Ensure camera is opened
-        camera = cv2.VideoCapture(get_external_camera())
+    return Response(generate_video(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-    shoe = shoes_collection.find_one({'_id': ObjectId(shoe_id)})
-    if not shoe:
-        return jsonify({'error': 'Shoe not found'}), 404
-
-    shoe_image_path = shoe.get('image')
-    if not shoe_image_path or not os.path.exists(shoe_image_path):
-        return jsonify({'error': 'Shoe image not found'}), 500
-
-    shoe_image = remove_background(shoe_image_path)
-
-    def generate_frames():
-        while True:
-            success, frame = camera.read()
-            if not success:
-                break
-
-            foot_region = detect_foot(frame)
-            if foot_region:
-                x, y, w, h = foot_region
-                processed_frame = overlay_shoe(frame, shoe_image, x, y, w, h)
-            else:
-                processed_frame = frame
-
-            _, buffer = cv2.imencode('.jpg', processed_frame)
-            frame_data = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
-
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/stop_camera', methods=['POST'])
+@app.route("/stop_camera", methods=["POST"])
 def stop_camera():
-    """Stops the camera feed when virtual try-on is closed."""
+    """Stops the camera when the modal is closed"""
     global camera
-    if camera and camera.isOpened():
+    if camera:
         camera.release()
-        return jsonify({'message': 'Camera released successfully'}), 200
-    return jsonify({'error': 'No active camera'}), 400
-
+        camera = None
+    return jsonify({"message": "Camera stopped"}), 200
 
 if __name__ == '__main__':
     try:
