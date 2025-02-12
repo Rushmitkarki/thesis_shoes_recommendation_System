@@ -1,20 +1,36 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef } from "react";
+import axios from "axios";
 
 interface VirtualTryOnProps {
   onClose: () => void;
-  selectedShoe: { image: string; name: string; id: string };
+  selectedShoe: { id: string };
 }
 
 export const VirtualTryOn: React.FC<VirtualTryOnProps> = ({
   onClose,
   selectedShoe,
 }) => {
-  const [videoUrl, setVideoUrl] = useState<string>("");
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     if (selectedShoe?.id) {
-      setVideoUrl(`http://localhost:5000/video_feed/${selectedShoe.id}`);
+      const video = videoRef.current;
+      if (video) {
+        video.src = `http://localhost:5000/video_feed/${selectedShoe.id}`;
+        video.load();
+        video.play();
+      }
     }
+
+    return () => {
+      axios
+        .post("http://localhost:5000/stop_camera")
+        .catch((error) => console.error("Error stopping camera:", error));
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.src = "";
+      }
+    };
   }, [selectedShoe]);
 
   return (
@@ -22,14 +38,12 @@ export const VirtualTryOn: React.FC<VirtualTryOnProps> = ({
       <div className="bg-white p-6 rounded-lg shadow-lg relative w-full max-w-lg">
         <h2 className="text-xl font-bold mb-4 text-center">Virtual Try-On</h2>
 
-        {/* Display the video stream */}
-        {videoUrl && (
-          <img
-            src={videoUrl}
-            alt="Virtual Try-On"
-            className="w-full rounded-lg border"
-          />
-        )}
+        <video
+          ref={videoRef}
+          className="w-full rounded-lg border"
+          autoPlay
+          playsInline
+        />
 
         <button
           onClick={onClose}

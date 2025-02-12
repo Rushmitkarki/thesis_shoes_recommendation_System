@@ -11,13 +11,39 @@ app = Flask(__name__)
 CORS(app)
 
 # MongoDB Connection
-client = MongoClient('mongodb://127.0.0.1:27017/shoes')
-db = client['shoe_store']
+client = MongoClient('mongodb://127.0.0.1:27017')
+db = client['shoes']
 shoes_collection = db['shoes']
+
+from flask import Flask, Response, request, jsonify
+from flask_cors import CORS
+from pymongo import MongoClient
+
+app = Flask(__name__)
+CORS(app)
+
+# MongoDB Connection
+client = MongoClient('mongodb://127.0.0.1:27017')
+db = client['shoes']
+shoes_collection = db['shoes']
+
+@app.route('/shoes', methods=['GET'])
+def get_shoes():
+    """Fetch shoes from the database with optional category filtering."""
+    category = request.args.get('category')
+    query = {}
+    if category:
+        query['category'] = category
+
+    shoes = list(shoes_collection.find(query, {"_id": 1, "name": 1, "brand": 1, "category": 1, "price": 1, "image": 1, "sizes": 1, "colors": 1}))
+    for shoe in shoes:
+        shoe["_id"] = str(shoe["_id"])
+    return jsonify(shoes)
+
+
 
 # Detect and use an external camera
 def get_external_camera():
-    """Detects and returns the index of an external camera."""
     for index in range(5):  # Check up to 5 camera indexes
         cap = cv2.VideoCapture(index)
         if cap.isOpened():
@@ -45,26 +71,17 @@ def remove_background(image_path):
 
 def detect_foot(frame):
     """Detects the foot region in the frame using color thresholding."""
-    # Convert frame to HSV color space
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Define a range for skin color (adjust these values as needed)
     lower_skin = np.array([0, 20, 70], dtype=np.uint8)
     upper_skin = np.array([20, 255, 255], dtype=np.uint8)
-
-    # Create a mask for the foot region
     mask = cv2.inRange(hsv, lower_skin, upper_skin)
-
-    # Find contours in the mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if contours:
-        # Find the largest contour (assumed to be the foot)
         largest_contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(largest_contour)
         return x, y, w, h
-    else:
-        return None
+    return None
 
 def overlay_shoe(frame, shoe_image, x, y, w, h):
     """Overlays the shoe image onto the detected foot region."""
@@ -90,6 +107,10 @@ def overlay_shoe(frame, shoe_image, x, y, w, h):
 @app.route('/video_feed/<shoe_id>')
 def video_feed(shoe_id):
     """Streams processed video frames with shoe overlay."""
+    global camera
+    if not camera or not camera.isOpened():  # Ensure camera is opened
+        camera = cv2.VideoCapture(get_external_camera())
+
     shoe = shoes_collection.find_one({'_id': ObjectId(shoe_id)})
     if not shoe:
         return jsonify({'error': 'Shoe not found'}), 404
@@ -106,16 +127,13 @@ def video_feed(shoe_id):
             if not success:
                 break
 
-            # Detect foot in the frame
             foot_region = detect_foot(frame)
             if foot_region:
                 x, y, w, h = foot_region
-                # Overlay the shoe image on the detected foot region
                 processed_frame = overlay_shoe(frame, shoe_image, x, y, w, h)
             else:
-                processed_frame = frame  # No foot detected, return the original frame
+                processed_frame = frame
 
-            # Encode the frame as JPEG
             _, buffer = cv2.imencode('.jpg', processed_frame)
             frame_data = buffer.tobytes()
             yield (b'--frame\r\n'
@@ -123,14 +141,15 @@ def video_feed(shoe_id):
 
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route('/shutdown', methods=['POST'])
-def shutdown():
-    """Releases the camera when closing the server."""
+@app.route('/stop_camera', methods=['POST'])
+def stop_camera():
+    """Stops the camera feed when virtual try-on is closed."""
     global camera
-    if camera:
+    if camera and camera.isOpened():
         camera.release()
-        camera = None
-    return jsonify({'message': 'Camera released and server shutting down'}), 200
+        return jsonify({'message': 'Camera released successfully'}), 200
+    return jsonify({'error': 'No active camera'}), 400
+
 
 if __name__ == '__main__':
     try:
