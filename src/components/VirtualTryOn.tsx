@@ -1,64 +1,81 @@
-import React, { useEffect, useRef } from "react";
-import axios from "axios";
+import React, { useEffect, useRef, useState } from "react";
 
 interface VirtualTryOnProps {
   onClose: () => void;
-  selectedShoe: { id: string };
+  selectedShoe: { _id: string; image: string }; 
 }
 
 export const VirtualTryOn: React.FC<VirtualTryOnProps> = ({
   onClose,
   selectedShoe,
 }) => {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [processedImage, setProcessedImage] = useState("");
 
   useEffect(() => {
     const startCamera = async () => {
       try {
-        // Request access to camera
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
         });
-
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
-
-        streamRef.current = stream;
-
-        // Delay before switching to shoe try-on video
-        setTimeout(() => {
-          if (videoRef.current) {
-            videoRef.current.srcObject = null;
-            videoRef.current.src = `http://localhost:5000/video_feed/${selectedShoe.id}`;
-            videoRef.current.load();
-            videoRef.current.play();
-          }
-        }, 3000); // Wait 3 seconds before switching to try-on video
       } catch (error) {
-        console.error("Error accessing camera:", error);
+        console.error("Error accessing webcam:", error);
       }
     };
 
     startCamera();
+  }, []);
 
-    return () => {
-      // Stop camera stream
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
+  useEffect(() => {
+    const captureAndProcessFrame = async () => {
+      if (!videoRef.current || !canvasRef.current) return;
 
-      // Notify backend to stop processing
-      axios
-        .post("http://localhost:5000/stop_camera")
-        .catch((error) => console.error("Error stopping camera:", error));
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
 
-      if (videoRef.current) {
-        videoRef.current.pause();
-        videoRef.current.src = "";
-      }
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      canvas.toBlob(async (blob) => {
+        if (!blob || !selectedShoe.image) {
+          console.error("Invalid shoe image URL:", selectedShoe.image);
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("frame", blob, "frame.jpg");
+        formData.append("shoe_id", selectedShoe._id);
+        formData.append("shoe_image", selectedShoe.image);
+
+        try {
+          const response = await fetch("http://localhost:5000/process_frame", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+          console.log("Response from server:", data); // Debugging response
+          if (data.image) {
+            setProcessedImage(`data:image/jpeg;base64,${data.image}`);
+          } else {
+            console.error("Server error:", data);
+          }
+        } catch (error) {
+          console.error("Error processing frame:", error);
+        }
+      }, "image/jpeg");
+
+      requestAnimationFrame(captureAndProcessFrame);
     };
+
+    const interval = setInterval(captureAndProcessFrame, 2000);
+    return () => clearInterval(interval);
   }, [selectedShoe]);
 
   return (
@@ -68,10 +85,19 @@ export const VirtualTryOn: React.FC<VirtualTryOnProps> = ({
 
         <video
           ref={videoRef}
-          className="w-full rounded-lg border"
           autoPlay
           playsInline
-        />
+          className="w-full rounded-lg"
+        ></video>
+        <canvas ref={canvasRef} className="hidden"></canvas>
+
+        {processedImage && (
+          <img
+            src={processedImage}
+            className="w-full rounded-lg border mt-4"
+            alt="Try-On Result"
+          />
+        )}
 
         <button
           onClick={onClose}

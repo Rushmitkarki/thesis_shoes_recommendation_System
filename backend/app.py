@@ -1,23 +1,14 @@
-from flask import Flask, Response, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
+import mediapipe as mp
 import numpy as np
-from pymongo import MongoClient
 import os
-from bson import ObjectId
+import base64
+import requests
 from rembg import remove
-
-app = Flask(__name__)
-CORS(app)
-
-# MongoDB Connection
-client = MongoClient('mongodb://127.0.0.1:27017')
-db = client['shoes']
-shoes_collection = db['shoes']
-
-from flask import Flask, Response, request, jsonify
-from flask_cors import CORS
 from pymongo import MongoClient
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 CORS(app)
@@ -26,7 +17,6 @@ CORS(app)
 client = MongoClient('mongodb://127.0.0.1:27017')
 db = client['shoes']
 shoes_collection = db['shoes']
-
 @app.route('/shoes', methods=['GET'])
 def get_shoes():
     """Fetch shoes from the database with optional category filtering."""
@@ -40,101 +30,109 @@ def get_shoes():
         shoe["_id"] = str(shoe["_id"])
     return jsonify(shoes)
 
+# Paths
+base_dir = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(base_dir, 'uploaded_images')
+PROCESSED_FOLDER = os.path.join(base_dir, 'processed_images')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
+# Thread pool for processing
+executor = ThreadPoolExecutor(max_workers=4)
 
-# Detect and use an external camera
-def get_external_camera():
-    for index in range(5):  # Check up to 5 camera indexes
-        cap = cv2.VideoCapture(index)
-        if cap.isOpened():
-            cap.release()
-            return index
-    return None
+# Initialize MediaPipe Pose detection
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
 
-camera_index = get_external_camera()
-if camera_index is None:
-    raise RuntimeError("No external camera detected!")
-
-camera = cv2.VideoCapture(camera_index)
-
-def remove_background(image_path):
-    """Removes the background from a shoe image using rembg."""
-    with open(image_path, "rb") as f:
-        image_data = f.read()
+def download_and_process_shoe(shoe_image_url, shoe_id):
+    """Downloads, removes background, and saves shoe image."""
+    shoe_path = os.path.join(UPLOAD_FOLDER, f"{shoe_id}.png")
     
-    output_data = remove(image_data)
+    response = requests.get(shoe_image_url, stream=True)
+    if response.status_code == 200:
+        with open(shoe_path, "wb") as file:
+            file.write(response.content)
     
-    np_array = np.frombuffer(output_data, np.uint8)
-    processed_image = cv2.imdecode(np_array, cv2.IMREAD_UNCHANGED)
+    shoe_image = cv2.imread(shoe_path, cv2.IMREAD_UNCHANGED)
+    if shoe_image is None:
+        return None
 
-    return processed_image
+    shoe_no_bg = remove(shoe_image)
 
-def detect_foot(frame):
-    """Detects the foot region in the frame using color thresholding."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-    upper_skin = np.array([20, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower_skin, upper_skin)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    processed_shoe_path = os.path.join(PROCESSED_FOLDER, f"{shoe_id}_processed.png")
+    cv2.imwrite(processed_shoe_path, shoe_no_bg)
+    return processed_shoe_path
 
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
-        return x, y, w, h
-    return None
-
-def overlay_shoe(frame, shoe_image, x, y, w, h):
-    """Overlays the shoe image onto the detected foot region."""
-    if shoe_image is None or shoe_image.shape[0] == 0 or shoe_image.shape[1] == 0:
+def overlay_shoe(frame, shoe_path, landmarks):
+    """Overlays shoe image on detected foot region."""
+    shoe = cv2.imread(shoe_path, cv2.IMREAD_UNCHANGED)
+    if shoe is None:
         return frame
 
-    shoe_resized = cv2.resize(shoe_image, (w, h), interpolation=cv2.INTER_AREA)
+    left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
+    right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
 
-    if shoe_resized.shape[2] == 3:
-        shoe_resized = cv2.cvtColor(shoe_resized, cv2.COLOR_BGR2BGRA)
-        shoe_resized[:, :, 3] = 255  # Ensure transparency
+    shoe_width = int(abs(right_ankle.x - left_ankle.x) * frame.shape[1])
+    shoe_height = int(0.2 * frame.shape[0])
 
-    overlay_result = frame.copy()
-    for c in range(3):
-        overlay_result[y:y+h, x:x+w, c] = np.where(
-            shoe_resized[:, :, 3] == 0,
-            frame[y:y+h, x:x+w, c],
-            shoe_resized[:, :, c]
-        )
+    shoe_resized = cv2.resize(shoe, (shoe_width, shoe_height), interpolation=cv2.INTER_AREA)
 
-    return overlay_result
+    x1 = int(left_ankle.x * frame.shape[1] - shoe_width / 2)
+    y1 = int(left_ankle.y * frame.shape[0] - shoe_height / 2)
+    x2, y2 = x1 + shoe_width, y1 + shoe_height
 
-def generate_video():
-    """Simulated function to return a video stream (Replace with actual implementation)"""
-    global camera
-    camera = cv2.VideoCapture(0)  # Open camera
+    # Overlay the shoe on the frame
+    try:
+        # Make sure shoe has an alpha channel (transparency)
+        if shoe.shape[2] == 4:
+            shoe_alpha = shoe[:, :, 3] / 255.0
+            for c in range(0, 3):  # RGB channels
+                frame[y1:y2, x1:x2, c] = (1 - shoe_alpha) * frame[y1:y2, x1:x2, c] + shoe_alpha * shoe_resized[:, :, c]
+        else:
+            frame[y1:y2, x1:x2] = shoe_resized
+    except Exception as e:
+        print(f"Error overlaying shoe: {e}")
 
-    while True:
-        success, frame = camera.read()
-        if not success:
-            break
-        _, buffer = cv2.imencode(".jpg", frame)
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-        )
+    return frame
 
-@app.route("/video_feed/<string:shoe_id>")
-def video_feed(shoe_id):
-    return Response(generate_video(), mimetype="multipart/x-mixed-replace; boundary=frame")
+@app.route('/process_frame', methods=['POST'])
+def process_frame():
+    """Processes frame and overlays shoe."""
+    shoe_id = request.form.get('shoe_id') or request.json.get('shoe_id')
+    shoe_image_url = request.form.get('shoe_image') or request.json.get('shoe_image')
 
-@app.route("/stop_camera", methods=["POST"])
-def stop_camera():
-    """Stops the camera when the modal is closed"""
-    global camera
-    if camera:
-        camera.release()
-        camera = None
-    return jsonify({"message": "Camera stopped"}), 200
+    if not shoe_id or not shoe_image_url:
+        return jsonify({"error": "Missing shoe ID or image URL"}), 400
+
+    print(f"Received shoe_id: {shoe_id}, shoe_image_url: {shoe_image_url}")
+
+    if shoe_image_url == "undefined" or not shoe_image_url.startswith("http"):
+        return jsonify({"error": "Invalid shoe image URL"}), 400
+
+    shoe_path = download_and_process_shoe(shoe_image_url, shoe_id)
+    if not shoe_path:
+        return jsonify({"error": "Failed to process shoe"}), 400
+
+    print(f"Shoe processed: {shoe_path}")
+
+    file = request.files.get('frame')
+    if not file:
+        return jsonify({"error": "No frame received"}), 400
+
+    frame = np.frombuffer(file.read(), np.uint8)
+    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+
+    results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    if results.pose_landmarks:
+        print("Pose landmarks detected:", results.pose_landmarks)
+
+        frame = overlay_shoe(frame, shoe_path, results.pose_landmarks.landmark)
+    else:
+        print("No pose landmarks detected")
+
+    _, buffer = cv2.imencode('.jpg', frame)
+    encoded_image = base64.b64encode(buffer).decode('utf-8')
+    return jsonify({'image': encoded_image})
 
 if __name__ == '__main__':
-    try:
-        app.run(debug=True, port=5000)
-    finally:
-        if camera:
-            camera.release()
+    app.run(host='0.0.0.0', port=5000, threaded=True)
