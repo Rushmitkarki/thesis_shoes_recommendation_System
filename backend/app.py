@@ -67,33 +67,46 @@ def overlay_shoe(frame, shoe_path, landmarks):
     """Overlays shoe image on detected foot region."""
     shoe = cv2.imread(shoe_path, cv2.IMREAD_UNCHANGED)
     if shoe is None:
+        print("Failed to load shoe image.")
         return frame
 
-    left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-    right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-
-    shoe_width = int(abs(right_ankle.x - left_ankle.x) * frame.shape[1])
-    shoe_height = int(0.2 * frame.shape[0])
-
-    shoe_resized = cv2.resize(shoe, (shoe_width, shoe_height), interpolation=cv2.INTER_AREA)
-
-    x1 = int(left_ankle.x * frame.shape[1] - shoe_width / 2)
-    y1 = int(left_ankle.y * frame.shape[0] - shoe_height / 2)
-    x2, y2 = x1 + shoe_width, y1 + shoe_height
-
-    # Overlay the shoe on the frame
     try:
-        # Make sure shoe has an alpha channel (transparency)
-        if shoe.shape[2] == 4:
-            shoe_alpha = shoe[:, :, 3] / 255.0
-            for c in range(0, 3):  # RGB channels
-                frame[y1:y2, x1:x2, c] = (1 - shoe_alpha) * frame[y1:y2, x1:x2, c] + shoe_alpha * shoe_resized[:, :, c]
+        left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        heel = landmarks[mp_pose.PoseLandmark.LEFT_HEEL]
+
+        # Calculate shoe width and height
+        shoe_width = int(abs(right_ankle.x - left_ankle.x) * frame.shape[1])
+        shoe_height = int(abs(heel.y - left_ankle.y) * frame.shape[0])
+
+        # Resize shoe
+        shoe_resized = cv2.resize(shoe, (shoe_width, shoe_height), interpolation=cv2.INTER_AREA)
+
+        # Calculate position for shoe overlay
+        x1 = int(left_ankle.x * frame.shape[1] - shoe_width // 2)
+        y1 = int(left_ankle.y * frame.shape[0] - shoe_height // 2)
+        x2, y2 = x1 + shoe_width, y1 + shoe_height
+
+        # Ensure overlay stays within frame bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+        # Overlay shoe on frame
+        if shoe.shape[2] == 4:  # Ensure the image has an alpha channel
+            shoe_alpha = shoe_resized[:, :, 3] / 255.0
+            for c in range(3):
+                frame[y1:y2, x1:x2, c] = (
+                    (1 - shoe_alpha) * frame[y1:y2, x1:x2, c]
+                    + shoe_alpha * shoe_resized[:, :, c]
+                )
         else:
             frame[y1:y2, x1:x2] = shoe_resized
+
     except Exception as e:
         print(f"Error overlaying shoe: {e}")
 
     return frame
+
 
 @app.route('/process_frame', methods=['POST'])
 def process_frame():
@@ -109,7 +122,8 @@ def process_frame():
     if shoe_image_url == "undefined" or not shoe_image_url.startswith("http"):
         return jsonify({"error": "Invalid shoe image URL"}), 400
 
-    shoe_path = download_and_process_shoe(shoe_image_url, shoe_id)
+    # shoe_path = download_and_process_shoe(shoe_image_url, shoe_id)
+    shoe_path = "processed_images/67ab7c854ee3363e276eddb0_processed.png"
     if not shoe_path:
         return jsonify({"error": "Failed to process shoe"}), 400
 
